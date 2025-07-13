@@ -26,9 +26,7 @@ func main() {
 	}
 
 	// Load Reverse L7
-	for _, rp := range config.ReverseProxies {
-		go proxies.StartHTTPSReverseProxy(rp)
-	}
+	go proxies.StartHTTPSReverseProxy(config.ReverseProxies)
 
 	select {}
 }
