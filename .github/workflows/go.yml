@@ -1,0 +1,42 @@
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows]
+        arch: [amd64]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.4'
+
+    - name: Build binary
+      run: |
+        mkdir -p build
+        if [ "${{ matrix.os }}" = "windows" ]; then
+          GOOS=windows GOARCH=${{ matrix.arch }} go build -o build/uproxy.exe main.go
+          cd build && zip uproxy-windows-${{ matrix.arch }}.zip uproxy.exe
+        else
+          GOOS=linux GOARCH=${{ matrix.arch }} go build -o build/uproxy main.go
+          cd build && tar -czf uproxy-linux-${{ matrix.arch }}.tar.gz uproxy
+        fi
+      shell: bash
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: uproxy-${{ matrix.os }}-${{ matrix.arch }}
+        path: build/*.zip, build/*.tar.gz
