@@ -13,7 +13,7 @@ import (
 // It accepts incoming TCP connections and forwards them to the configured backend server.
 // Uses Proxy Protocol v2 header to forward client info to backend.
 func StartTCPProxy(config *config.Config, cfg config.ProxyConfig) {
-	listenAddr := fmt.Sprintf(":%d", cfg.ListenPort)
+	listenAddr := net.JoinHostPort(cfg.ListenIP, strconv.Itoa(cfg.ListenPort))
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		logger.Error("Failed to bind TCP listener on %s: %v", listenAddr, err)

@@ -33,7 +33,13 @@ func StartUDPProxy(config *config.Config, cfg config.ProxyConfig) {
 	localPort := cfg.ListenPort
 	debugMode := config.DebugMode
 
-	addr := &net.UDPAddr{IP: net.IPv4zero, Port: localPort}
+	bindIP := net.ParseIP(cfg.ListenIP)
+	if bindIP == nil {
+		logger.Error("Invalid ListenIP: %s", cfg.ListenIP)
+		return
+	}
+	
+	addr := &net.UDPAddr{IP: bindIP, Port: localPort}
 	mainConn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		logger.Error("Failed to bind: %v", err)

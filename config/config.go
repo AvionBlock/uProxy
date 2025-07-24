@@ -8,6 +8,7 @@ import (
 )
 
 type ProxyConfig struct {
+	ListenIP   string `json:"listenIP"` 
 	ListenPort int    `json:"listenPort"`
 	ServerHost string `json:"serverHost"`
 	ServerPort int    `json:"serverPort"`
@@ -50,6 +51,12 @@ func LoadConfig(path string) (*Config, error) {
 			switch choice {
 			case 1, 2:
 				var proxy ProxyConfig
+
+				fmt.Print("Listening IP (default 0.0.0.0): ")
+				fmt.Scan(&proxy.ListenIP)
+				if proxy.ListenIP == "" {
+					proxy.ListenIP = "0.0.0.0"
+				}
 
 				fmt.Print("Listening port: ")
 				fmt.Scan(&proxy.ListenPort)
