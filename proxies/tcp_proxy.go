@@ -1,7 +1,6 @@
 package proxies
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"strconv"
