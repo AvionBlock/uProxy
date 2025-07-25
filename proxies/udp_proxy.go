@@ -60,14 +60,14 @@ func StartUDPProxy(config *config.Config, cfg config.ProxyConfig) {
 		copy(data, buf[:n])
 
 		// Handle each UDP packet concurrently
-		go handlePacket(mainConn, data, raddr, serverIP, serverPort, localPort, debugMode)
+		go handlePacket(mainConn, bindIP, data, raddr, serverIP, serverPort, localPort, debugMode)
 	}
 }
 
 // handlePacket processes a single UDP packet from client or server.
 // Differentiates packets by source IP/port, manages client sessions,
 // sends Proxy Protocol header when needed, and forwards packets.
-func handlePacket(mainConn *net.UDPConn, data []byte, raddr *net.UDPAddr, serverIP net.IP, serverPort, localPort int, debugMode bool) {
+func handlePacket(mainConn *net.UDPConn, bindIP net.IP, data []byte, raddr *net.UDPAddr, serverIP net.IP, serverPort, localPort int, debugMode bool) {
 	if len(data) == 0 {
 		return
 	}
@@ -89,7 +89,7 @@ func handlePacket(mainConn *net.UDPConn, data []byte, raddr *net.UDPAddr, server
 
 		if !exists {
 			// Create new UDP socket for this client port
-			clientAddr := &net.UDPAddr{IP: net.IPv4zero, Port: raddr.Port}
+			clientAddr := &net.UDPAddr{IP: bindIP, Port: raddr.Port}
 			cliConn, err := net.ListenUDP("udp", clientAddr)
 			if err != nil {
 				logger.Error("Failed to create socket for client port %d: %v", raddr.Port, err)
