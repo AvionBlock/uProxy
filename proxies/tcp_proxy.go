@@ -1,9 +1,12 @@
 package proxies
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"time"
 	"uproxy/config"
 	"uproxy/core"
 )
@@ -11,12 +14,11 @@ import (
 // StartTCPProxy starts a TCP proxy server listening on the port defined in cfg.ListenPort.
 // It accepts incoming TCP connections and forwards them to the configured backend server.
 // Uses Proxy Protocol v2 header to forward client info to backend.
-func StartTCPProxy(config *config.Config, cfg config.ProxyConfig) {
+func StartTCPProxy(config *config.Config, cfg config.ProxyConfig) error {
 	listenAddr := net.JoinHostPort(cfg.ListenIP, strconv.Itoa(cfg.ListenPort))
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		logger.Error("Failed to bind TCP listener on %s: %v", listenAddr, err)
-		return
+		return fmt.Errorf("bind TCP listener on %s: %w", listenAddr, err)
 	}
 	defer listener.Close()
 
@@ -25,8 +27,7 @@ func StartTCPProxy(config *config.Config, cfg config.ProxyConfig) {
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			logger.Warn("Failed to accept TCP connection: %v", err)
-			continue
+			return fmt.Errorf("accept TCP connection: %w", err)
 		}
 		// Handle each connection concurrently
 		go handleTCPConnection(clientConn, config, cfg)
@@ -46,7 +47,11 @@ func handleTCPConnection(clientConn net.Conn, config *config.Config, cfg config.
 	}
 
 	serverAddr := net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort))
-	serverConn, err := net.Dial("tcp", serverAddr)
+	network := "tcp4"
+	if clientAddr.IP.To4() == nil {
+		network = "tcp6"
+	}
+	serverConn, err := net.DialTimeout(network, serverAddr, 10*time.Second)
 	if err != nil {
 		logger.Error("Failed to connect to TCP server %s: %v", serverAddr, err)
 		return
@@ -58,14 +63,23 @@ func handleTCPConnection(clientConn net.Conn, config *config.Config, cfg config.
 	}
 
 	// Prepare and send Proxy Protocol v2 header to backend server
-	ppHeader := core.EncodeProxyProtocolV2(
-		0x11, // TCP over IPv4
+	serverTCPAddr := serverConn.RemoteAddr().(*net.TCPAddr)
+	proto := byte(0x11) // TCP4
+	if clientAddr.IP.To4() == nil {
+		proto = 0x21 // TCP6
+	}
+	ppHeader, err := core.EncodeProxyProtocolV2(
+		proto,
 		clientAddr.IP,
 		clientAddr.Port,
-		net.ParseIP(cfg.ServerHost),
-		cfg.ServerPort,
+		serverTCPAddr.IP,
+		serverTCPAddr.Port,
 	)
-	_, err = serverConn.Write(ppHeader)
+	if err != nil {
+		logger.Error("Cannot encode Proxy Protocol header: %v", err)
+		return
+	}
+	_, err = io.Copy(serverConn, bytes.NewReader(ppHeader))
 	if err != nil {
 		logger.Error("Failed to send Proxy Protocol header: %v", err)
 		return
@@ -77,13 +91,17 @@ func handleTCPConnection(clientConn net.Conn, config *config.Config, cfg config.
 		if err != nil {
 			logger.Warn("Client → Server error: %v", err)
 		}
-		serverConn.Close()
-		clientConn.Close()
+		if tcp, ok := serverConn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
 	}()
 
 	// Pipe server → client (blocking)
 	_, err = io.Copy(clientConn, serverConn)
 	if err != nil {
 		logger.Warn("Server → Client error: %v", err)
+	}
+	if tcp, ok := clientConn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
 	}
 }

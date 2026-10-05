@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"uproxy/config"
 	"uproxy/core"
 	"uproxy/proxies"
@@ -9,24 +10,30 @@ import (
 var logger = core.NewLogger()
 
 func main() {
-	config, err := config.LoadConfig("config.json")
+	cfg, err := config.LoadConfig("config.json")
 	if err != nil {
 		logger.Error("Failed to load config: %v", err)
-		return
+		os.Exit(1)
 	}
 
-	// Load L4 Proxy
-	for _, proxy := range config.Proxies {
+	errCh := make(chan error, len(cfg.Proxies)+1)
+	for _, proxy := range cfg.Proxies {
 		p := proxy
 		if proxy.ProtoTCP {
-			go proxies.StartTCPProxy(config, p)
+			go func() { errCh <- proxies.StartTCPProxy(cfg, p) }()
 		} else {
-			go proxies.StartUDPProxy(config, p)
+			go func() { errCh <- proxies.StartUDPProxy(cfg, p) }()
 		}
 	}
 
-	// Load Reverse L7
-	go proxies.StartHTTPSReverseProxy(config.ReverseProxies)
+	if len(cfg.ReverseProxies) > 0 {
+		go func() { errCh <- proxies.StartHTTPSReverseProxy(cfg.ReverseProxies) }()
+	}
+	if len(cfg.Proxies) == 0 && len(cfg.ReverseProxies) == 0 {
+		logger.Error("No proxies configured")
+		os.Exit(1)
+	}
 
-	select {}
+	logger.Error("Proxy stopped: %v", <-errCh)
+	os.Exit(1)
 }

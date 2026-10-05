@@ -1,44 +1,56 @@
 name: Go
 
-on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+on: [push, pull_request]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+      - name: Race detector
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)"
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [linux, windows]
-        arch: [amd64]
-
+        include:
+          - goos: linux
+            artifact: uproxy-linux-amd64
+            binary: uproxy
+          - goos: windows
+            artifact: uproxy-windows-amd64
+            binary: uproxy.exe
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.24.4"
-
-      - name: Build binary
-        run: |
-          mkdir -p build
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            GOOS=windows GOARCH=${{ matrix.arch }} go build -o build/uproxy.exe main.go
-            cd build && zip uproxy-windows-${{ matrix.arch }}.zip uproxy.exe
-          else
-            GOOS=linux GOARCH=${{ matrix.arch }} go build -o build/uproxy main.go
-            cd build && tar -czf uproxy-linux-${{ matrix.arch }}.tar.gz uproxy
-          fi
-        shell: bash
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -o ${{ matrix.binary }} .
+      - uses: actions/upload-artifact@v7
         with:
-          name: uproxy-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            build/*.zip
-            build/*.tar.gz
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}

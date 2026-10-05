@@ -1,207 +1,214 @@
 package proxies
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"net"
-	"strings"
+	"net/netip"
+	"strconv"
 	"sync"
 	"time"
+
 	"uproxy/config"
 	"uproxy/core"
 )
 
-// ClientInfo holds info about a UDP client connection.
-type ClientInfo struct {
-	Addr       *net.UDPAddr // Client UDP address
-	HeaderSent bool         // Whether Proxy Protocol header was sent
-	LastActive time.Time    // Last activity timestamp
-	Conn       *net.UDPConn // UDP connection dedicated to client
+const udpIdleTimeout = 30 * time.Second
+const defaultMaxUDPSessions = 4096
+
+type udpSession struct {
+	client     *net.UDPAddr
+	conn       *net.UDPConn
+	lastActive time.Time // guarded by udpProxy.mu
 }
 
-var (
-	clients   = make(map[int]*ClientInfo) // Map client port -> ClientInfo
-	clientsMu sync.Mutex                  // Mutex to protect clients map
-)
+type udpProxy struct {
+	listener            *net.UDPConn
+	backend             *net.UDPAddr
+	network             string
+	debug               bool
+	idle                time.Duration
+	maxSessions         int
+	mu                  sync.Mutex
+	sessions            map[netip.AddrPort]*udpSession
+	closed              bool
+	lastCapacityWarning time.Time
+}
 
-// StartUDPProxy starts the UDP proxy server.
-// It listens on cfg.ListenPort and forwards UDP packets between clients and backend server.
-// Maintains per-client UDP sockets and handles Proxy Protocol v2 header for new clients.
-func StartUDPProxy(config *config.Config, cfg config.ProxyConfig) {
-	serverIP := net.ParseIP(cfg.ServerHost)
-	serverPort := cfg.ServerPort
-	localPort := cfg.ListenPort
-	debugMode := config.DebugMode
-
-	bindIP := net.ParseIP(cfg.ListenIP)
-	if bindIP == nil {
-		logger.Error("Invalid ListenIP: %s", cfg.ListenIP)
-		return
+// StartUDPProxy relays each client's datagrams through a dedicated backend
+// socket. Geyser identifies the client by that socket after the first PROXY v2
+// header, so subsequent datagrams must use the same socket without a header.
+func StartUDPProxy(conf *config.Config, cfg config.ProxyConfig) error {
+	idle := udpIdleTimeout
+	if cfg.UDPIdleTimeoutSeconds > 0 {
+		idle = time.Duration(cfg.UDPIdleTimeoutSeconds) * time.Second
 	}
-	
-	addr := &net.UDPAddr{IP: bindIP, Port: localPort}
-	mainConn, err := net.ListenUDP("udp", addr)
+	p, err := newUDPProxy(cfg, conf.DebugMode, idle)
 	if err != nil {
-		logger.Error("Failed to bind: %v", err)
-		return
+		return err
 	}
-	defer mainConn.Close()
+	defer p.Close()
+	logger.Info("UDP proxy listening on %s -> %s", p.listener.LocalAddr(), p.backend)
+	return p.serve()
+}
 
-	logger.Info("UDP proxy listening on %s", mainConn.LocalAddr())
+func newUDPProxy(cfg config.ProxyConfig, debug bool, idle time.Duration) (*udpProxy, error) {
+	listenIP := cfg.ListenIP
+	if listenIP == "" {
+		listenIP = "0.0.0.0"
+	}
+	bindIP := net.ParseIP(listenIP)
+	if bindIP == nil {
+		return nil, fmt.Errorf("invalid UDP listen IP %q", listenIP)
+	}
+	if idle <= 0 {
+		return nil, fmt.Errorf("UDP idle timeout must be positive")
+	}
+	maxSessions := cfg.MaxUDPSessions
+	if maxSessions == 0 {
+		maxSessions = defaultMaxUDPSessions
+	}
+	if maxSessions < 0 {
+		return nil, fmt.Errorf("UDP session limit must be positive")
+	}
+	network := "udp6"
+	if bindIP.To4() != nil {
+		network = "udp4"
+	}
+	backend, err := net.ResolveUDPAddr(network, net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)))
+	if err != nil {
+		return nil, fmt.Errorf("resolve UDP backend: %w", err)
+	}
+	listener, err := net.ListenUDP(network, &net.UDPAddr{IP: bindIP, Port: cfg.ListenPort})
+	if err != nil {
+		return nil, fmt.Errorf("bind UDP listener: %w", err)
+	}
+	return &udpProxy{
+		listener: listener, backend: backend, network: network,
+		debug: debug, idle: idle, maxSessions: maxSessions, sessions: make(map[netip.AddrPort]*udpSession),
+	}, nil
+}
 
-	buf := make([]byte, 2048)
+func (p *udpProxy) serve() error {
+	buf := make([]byte, 65535)
 	for {
-		n, raddr, err := mainConn.ReadFromUDP(buf)
+		n, client, err := p.listener.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			logger.Warn("read error: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("read UDP client: %w", err)
+		}
+		if n == 0 || client == p.backend.AddrPort() {
 			continue
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-
-		// Handle each UDP packet concurrently
-		go handlePacket(mainConn, bindIP, data, raddr, serverIP, serverPort, localPort, debugMode)
+		p.forward(client, buf[:n])
 	}
 }
 
-// handlePacket processes a single UDP packet from client or server.
-// Differentiates packets by source IP/port, manages client sessions,
-// sends Proxy Protocol header when needed, and forwards packets.
-func handlePacket(mainConn *net.UDPConn, bindIP net.IP, data []byte, raddr *net.UDPAddr, serverIP net.IP, serverPort, localPort int, debugMode bool) {
-	if len(data) == 0 {
+func (p *udpProxy) forward(client netip.AddrPort, data []byte) {
+	key := client
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
 		return
 	}
-	typeHex := fmt.Sprintf("%02x", data[0])
-
-	clientsMu.Lock()
-	defer clientsMu.Unlock()
-
-	if !raddr.IP.Equal(serverIP) {
-		// Packet from client
-		if debugMode {
-			logger.Info("0x%s packet received from client: %s:%d", typeHex, raddr.IP, raddr.Port)
-		} else if _, exists := clients[raddr.Port]; !exists {
-			logger.Info("New client connected: %s:%d", raddr.IP, raddr.Port)
-		}
-
-		client, exists := clients[raddr.Port]
-		now := time.Now()
-
-		if !exists {
-			// Create new UDP socket for this client port
-			clientAddr := &net.UDPAddr{IP: bindIP, Port: raddr.Port}
-			cliConn, err := net.ListenUDP("udp", clientAddr)
-			if err != nil {
-				logger.Error("Failed to create socket for client port %d: %v", raddr.Port, err)
-				return
+	session := p.sessions[key]
+	packet := data
+	isNew := false
+	if session == nil {
+		isNew = true
+		if len(p.sessions) >= p.maxSessions {
+			if time.Since(p.lastCapacityWarning) >= time.Minute {
+				logger.Warn("UDP session limit (%d) reached; dropping new clients", p.maxSessions)
+				p.lastCapacityWarning = time.Now()
 			}
-
-			client = &ClientInfo{
-				Addr:       raddr,
-				HeaderSent: false,
-				LastActive: now,
-				Conn:       cliConn,
-			}
-			clients[raddr.Port] = client
-
-			// Start goroutine to read responses from server and send back to client
-			go handleServerToClient(mainConn, client, serverIP, serverPort, localPort, debugMode)
-		} else {
-			client.LastActive = now
-		}
-
-		// Send Proxy Protocol v2 header on first specific packet types
-		if !client.HeaderSent && (strings.Contains(typeHex, "01") || strings.Contains(typeHex, "05")) {
-			logger.Warn("Send with header for client %d!", raddr.Port)
-			messageWithHeader := append(core.EncodeProxyProtocolV2(0x12, raddr.IP, raddr.Port, serverIP, serverPort), data...)
-			_, err := client.Conn.WriteToUDP(messageWithHeader, &net.UDPAddr{IP: serverIP, Port: serverPort})
-			if err != nil {
-				logger.Error("Error sending to server with header: %v", err)
-			}
-			client.HeaderSent = true
-		} else {
-			_, err := client.Conn.WriteToUDP(data, &net.UDPAddr{IP: serverIP, Port: serverPort})
-			if err != nil {
-				logger.Error("Error sending to server: %v", err)
-			}
-		}
-
-	} else if raddr.Port == serverPort {
-		// Packet from server
-		if debugMode {
-			logger.Info("0x%s packet received from server: %s:%d", typeHex, raddr.IP, raddr.Port)
-		}
-
-		// Find client by matching UDP socket local port
-		sendPort := 0
-		for port, c := range clients {
-			if c.Conn.LocalAddr().(*net.UDPAddr).Port == raddr.Port {
-				sendPort = port
-				break
-			}
-		}
-		if sendPort == 0 {
-			logger.Warn("No client found for server response port %d", raddr.Port)
 			return
 		}
+		proto := byte(0x12) // UDP4
+		if p.network == "udp6" {
+			proto = 0x22 // UDP6
+		}
+		header, err := core.EncodeProxyProtocolV2(proto, client.Addr().AsSlice(), int(client.Port()), p.backend.IP, p.backend.Port)
+		if err != nil {
+			logger.Warn("Cannot forward UDP client %s: %v", client, err)
+			return
+		}
+		// Let the OS select the backend-facing source IP. The public listen IP
+		// may be a different interface (or Geyser may be on loopback).
+		conn, err := net.DialUDP(p.network, nil, p.backend)
+		if err != nil {
+			logger.Error("Cannot connect UDP backend for %s: %v", client, err)
+			return
+		}
+		session = &udpSession{client: net.UDPAddrFromAddrPort(client), conn: conn}
+		p.sessions[key] = session
+		packet = make([]byte, len(header)+len(data))
+		copy(packet, header)
+		copy(packet[len(header):], data)
+		logger.Info("New UDP client: %s", client)
+		go p.relayResponses(key, session)
+	}
+	session.lastActive = time.Now()
+	if isNew {
+		if err := session.conn.SetReadDeadline(session.lastActive.Add(p.idle)); err != nil {
+			logger.Error("Set UDP deadline for %s: %v", client, err)
+			p.removeSessionLocked(key, session)
+			return
+		}
+	}
+	if _, err := session.conn.Write(packet); err != nil {
+		logger.Error("Forward UDP packet from %s: %v", client, err)
+		p.removeSessionLocked(key, session)
+	} else if p.debug {
+		logger.Info("Forwarded %d UDP bytes from %s", len(data), client)
+	}
+}
 
-		client := clients[sendPort]
-		// Timeout clients inactive for 30 seconds
-		if time.Since(client.LastActive) > 30*time.Second {
-			logger.Warn("Client %d timed out, closing socket", sendPort)
-			client.Conn.Close()
-			delete(clients, sendPort)
-		} else {
-			// Replace server port in data with local listening port if needed
-			oldPort := []byte(fmt.Sprintf("%05d", serverPort))
-			newPort := []byte(fmt.Sprintf("%05d", localPort))
-			dataToSend := data
-			if !bytes.Equal(oldPort, newPort) {
-				dataToSend = bytes.ReplaceAll(data, oldPort, newPort)
+func (p *udpProxy) relayResponses(key netip.AddrPort, session *udpSession) {
+	buf := make([]byte, 65535)
+	for {
+		n, err := session.conn.Read(buf)
+		if err != nil {
+			p.mu.Lock()
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() &&
+				p.sessions[key] == session && time.Since(session.lastActive) < p.idle {
+				_ = session.conn.SetReadDeadline(session.lastActive.Add(p.idle))
+				p.mu.Unlock()
+				continue
 			}
-
-			_, err := mainConn.WriteToUDP(dataToSend, client.Addr)
-			if err != nil {
-				logger.Error("Error sending response to client: %v", err)
+			p.removeSessionLocked(key, session)
+			p.mu.Unlock()
+			return
+		}
+		if p.debug {
+			logger.Info("Received %d UDP bytes for %s", n, session.client)
+		}
+		if _, err := p.listener.WriteToUDP(buf[:n], session.client); err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				logger.Error("Return UDP packet to %s: %v", session.client, err)
 			}
+			p.mu.Lock()
+			p.removeSessionLocked(key, session)
+			p.mu.Unlock()
+			return
 		}
 	}
 }
 
-// handleServerToClient reads packets from the backend server via the client's UDP socket
-// and forwards them back to the client via the main listening socket.
-// Also handles client timeout and socket cleanup.
-func handleServerToClient(mainConn *net.UDPConn, client *ClientInfo, serverIP net.IP, serverPort, localPort int, debugMode bool) {
-	buf := make([]byte, 2048)
-	for {
-		n, from, err := client.Conn.ReadFromUDP(buf)
-		if err != nil {
-			logger.Warn("Socket %d closed or error: %v", client.Addr.Port, err)
-			clientsMu.Lock()
-			delete(clients, client.Addr.Port)
-			clientsMu.Unlock()
-			return
-		}
-		respData := make([]byte, n)
-		copy(respData, buf[:n])
-
-		if debugMode {
-			logger.Info("0x%x packet received from server: %s:%d", respData[0], from.IP, from.Port)
-		}
-
-		// Check for client timeout
-		if time.Since(client.LastActive) > 30*time.Second {
-			logger.Warn("Client %d timed out, closing socket", client.Addr.Port)
-			client.Conn.Close()
-			clientsMu.Lock()
-			delete(clients, client.Addr.Port)
-			clientsMu.Unlock()
-			return
-		}
-
-		_, err = mainConn.WriteToUDP(respData, client.Addr)
-		if err != nil {
-			logger.Error("Error sending response to client: %v", err)
-		}
+func (p *udpProxy) removeSessionLocked(key netip.AddrPort, session *udpSession) {
+	if p.sessions[key] == session {
+		delete(p.sessions, key)
+		_ = session.conn.Close()
 	}
+}
+
+func (p *udpProxy) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	for key, session := range p.sessions {
+		p.removeSessionLocked(key, session)
+	}
+	p.mu.Unlock()
+	return p.listener.Close()
 }
