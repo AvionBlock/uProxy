@@ -1,0 +1,53 @@
+{
+  "debugMode": false,
+  "proxies": [
+    {
+      "name": "geyser-bedrock",
+      "listenIP": "0.0.0.0",
+      "listenPort": 19132,
+      "serverHost": "10.0.0.2",
+      "serverPort": 19132,
+      "protocol": "bedrock",
+      "proxyProtocol": true,
+      "udpMode": "auto",
+      "idleTimeout": "60s"
+    },
+    {
+      "name": "geyser-raknet-legacy",
+      "listenIP": "0.0.0.0",
+      "listenPort": 19133,
+      "serverHost": "10.0.0.2",
+      "serverPort": 19133,
+      "protocol": "udp",
+      "udpMode": "raknet"
+    },
+    {
+      "name": "bds-plain",
+      "listenIP": "0.0.0.0",
+      "listenPort": 19134,
+      "serverHost": "10.0.0.3",
+      "serverPort": 19132,
+      "protocol": "bedrock",
+      "proxyProtocol": false
+    },
+    {
+      "name": "java",
+      "listenIP": "0.0.0.0",
+      "listenPort": 25565,
+      "serverHost": "10.0.0.2",
+      "serverPort": 25565,
+      "protocol": "tcp",
+      "proxyProtocol": true
+    }
+  ],
+  "reverseProxies": [
+    {
+      "listenPort": 443,
+      "domain": "play.example.com",
+      "certFile": "/etc/letsencrypt/live/play.example.com/fullchain.pem",
+      "keyFile": "/etc/letsencrypt/live/play.example.com/privkey.pem",
+      "serverHost": "10.0.0.2:19132",
+      "serverProto": "http"
+    }
+  ]
+}

@@ -3,35 +3,71 @@ name: Go
 on:
   push:
     branches: ["main"]
+    tags: ["v*"]
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [linux, windows]
-        arch: [amd64]
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: windows, arch: amd64 }
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.24.4"
+          go-version-file: go.mod
+          check-latest: true
 
       - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
         run: |
           mkdir -p build
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            GOOS=windows GOARCH=${{ matrix.arch }} go build -o build/uproxy.exe main.go
-            cd build && zip uproxy-windows-${{ matrix.arch }}.zip uproxy.exe
+          VERSION="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" -o "build/uproxy${EXT}" .
+          cd build
+          if [ "$GOOS" = "windows" ]; then
+            zip "uproxy-${GOOS}-${GOARCH}.zip" "uproxy${EXT}"
           else
-            GOOS=linux GOARCH=${{ matrix.arch }} go build -o build/uproxy main.go
-            cd build && tar -czf uproxy-linux-${{ matrix.arch }}.tar.gz uproxy
+            tar -czf "uproxy-${GOOS}-${GOARCH}.tar.gz" "uproxy${EXT}"
           fi
         shell: bash
 
